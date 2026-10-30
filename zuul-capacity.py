@@ -6,6 +6,7 @@
 
 import argparse
 import openstack
+import kubernetes
 import logging
 import time
 import yaml
@@ -13,6 +14,15 @@ from dataclasses import dataclass
 from prometheus_client import start_http_server, Gauge, Counter
 
 log = logging.getLogger("zuul-capacity")
+
+
+def parse_k8s_quantity(value):
+    "Parse a Kubernetes binary quantity (e.g. '8Gi') into bytes."
+    units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+    for suffix, factor in units.items():
+        if value.endswith(suffix):
+            return int(float(value[: -len(suffix)]) * factor)
+    return int(value)
 
 
 @dataclass
@@ -35,6 +45,23 @@ class Resource:
         flavor = flavors[flavor_id]
         return Resource(flavor["ram"], flavor["vcpus"], flavor["disk"])
 
+    def from_kubevirt_vm(vm):
+        domain = vm["spec"]["template"]["spec"]["domain"]
+        mem = parse_k8s_quantity(domain["memory"]["guest"]) // (1024**2)
+        cpu = domain["cpu"]["cores"]
+        disk = 0
+        for dvt in vm["spec"].get("dataVolumeTemplates", []):
+            storage = (
+                dvt.get("spec", {})
+                .get("storage", {})
+                .get("resources", {})
+                .get("requests", {})
+                .get("storage")
+            )
+            if storage:
+                disk += parse_k8s_quantity(storage) // (1024**3)
+        return Resource(mem, cpu, disk)
+
 
 def get_resources(flavors, cloud):
     "Get the cloud resources."
@@ -50,14 +77,70 @@ def get_resources(flavors, cloud):
     return resources
 
 
+def get_kubevirt_resources(client, namespace):
+    "Get the nodepool-managed KubeVirt VM resources for a namespace."
+    resources = []
+    vms = client.list_namespaced_custom_object(
+        group="kubevirt.io",
+        version="v1",
+        namespace=namespace,
+        plural="virtualmachines",
+    )
+    for vm in vms.get("items", []):
+        annotations = vm.get("metadata", {}).get("annotations", {})
+        if not annotations.get("prekv.io/nodepool_provider_name"):
+            continue
+        try:
+            resources.append(Resource.from_kubevirt_vm(vm))
+        except Exception as e:
+            log.exception("Couldn't get VM resource %s: %s", vm, e)
+    return resources
+
+
+def get_kubeconfig_namespace(kubeconfig, context):
+    "Look up the namespace of a kubeconfig context."
+    contexts, active_context = kubernetes.config.list_kube_config_contexts(
+        config_file=kubeconfig
+    )
+    selected_context = context or (active_context or {}).get("name")
+    for item in contexts:
+        if item.get("name") == selected_context:
+            namespace = item.get("context", {}).get("namespace")
+            if namespace:
+                return namespace
+    raise ValueError(
+        f"Context {selected_context} is missing a namespace in {kubeconfig}"
+    )
+
+
 @dataclass
 class Provider:
     max_server: int
-    cloud: any
+    driver: str
+    cloud: any = None
+    namespace: str = None
 
     def from_nodepool(provider):
         return Provider(
-            provider.get("max-server", -1), openstack.connect(cloud=provider["cloud"])
+            provider.get("max-server", -1),
+            "openstack",
+            cloud=openstack.connect(cloud=provider["cloud"]),
+        )
+
+    def from_kubevirt(kubeconfig, context):
+        if context is None:
+            _, active_context = kubernetes.config.list_kube_config_contexts(
+                config_file=kubeconfig
+            )
+            context = (active_context or {}).get("name")
+        api_client = kubernetes.config.new_client_from_config(
+            config_file=kubeconfig, context=context
+        )
+        return context, Provider(
+            -1,
+            "kubevirt",
+            cloud=kubernetes.client.CustomObjectsApi(api_client),
+            namespace=get_kubeconfig_namespace(kubeconfig, context),
         )
 
 
@@ -74,7 +157,10 @@ def get_providers(nodepool_yaml):
 
 
 def update_provider_metric(metrics, flavors, name, provider):
-    resources = get_resources(flavors, provider.cloud)
+    if provider.driver == "kubevirt":
+        resources = get_kubevirt_resources(provider.cloud, provider.namespace)
+    else:
+        resources = get_resources(flavors, provider.cloud)
     metrics["instances"].labels(cloud=name).set(len(resources))
     cpu, mem, disk = 0, 0, 0
     for resource in resources:
@@ -109,6 +195,18 @@ def usage():
         default=8080,
         help="The prometheus scrap target listening port",
     )
+    parser.add_argument(
+        "--kubevirt-kubeconfig",
+        metavar="FILE",
+        default=None,
+        help="Kubeconfig for a KubeVirt-backed provider",
+    )
+    parser.add_argument(
+        "--kubevirt-context",
+        default=None,
+        help="Kubeconfig context to use for the KubeVirt provider,"
+        " also used as the provider name",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +223,11 @@ def main():
     )
 
     providers = get_providers(args.nodepool)
+    if args.kubevirt_kubeconfig:
+        name, provider = Provider.from_kubevirt(
+            args.kubevirt_kubeconfig, args.kubevirt_context
+        )
+        providers[name] = provider
     flavors = dict()
 
     update_providers_metric(metrics, flavors, providers)
