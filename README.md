@@ -5,37 +5,31 @@ This is a custom prometheus exporter to provide the available capacity as a metr
 ```ShellSession
 $ uv run ./zuul-capacity.py --help
 usage: zuul-capacity.py [-h] [--nodepool FILE] [--port PORT]
-                        [--kubevirt-kubeconfig FILE]
-                        [--kubevirt-context KUBEVIRT_CONTEXT]
 
 options:
-  -h, --help            show this help message and exit
-  --nodepool FILE       The list of providers
-  --port PORT           The prometheus scrap target listening port
-  --kubevirt-kubeconfig FILE
-                        Kubeconfig for a KubeVirt-backed provider
-  --kubevirt-context KUBEVIRT_CONTEXT
-                        Kubeconfig context to use for the KubeVirt provider,
-                        also used as the provider name
+  -h, --help       show this help message and exit
+  --nodepool FILE  The list of providers
+  --port PORT      The prometheus scrap target listening port
 ```
 
 To run this service, you must provide a nodepool configuration and a clouds.yaml.
 
-A KubeVirt-backed provider (e.g. a nodepool driver provider backed by
-[prekv](https://gitlab.com/softwarefactory-project/prekv)) isn't discovered
-from the nodepool configuration, since its resources (CPU, memory, disk) are
-not exposed through the API. Pass `--kubevirt-kubeconfig` to
-report it instead, by querying the KubeVirt `VirtualMachine` resources in the
-kubeconfig context's namespace directly; the context name is used as the
-`cloud` label, and only VMs carrying a non-empty `prekv.io/nodepool_provider_name`
-annotation (i.e. nodepool-managed VMs) are counted.
+Nodepool `aws` driver providers (e.g. one backed by
+[prekv](https://gitlab.com/softwarefactory-project/prekv), which exposes a
+KubeVirt cluster through an EC2-compatible API) are also discovered from the
+nodepool configuration: each such provider needs a `profile-name` pointing at
+a profile in the standard AWS config/credentials files (`AWS_CONFIG_FILE` /
+`~/.aws/config`), exactly as Nodepool's own `aws` driver expects. Instance
+counts and CPU/memory come from `DescribeInstances`/`DescribeInstanceTypes`;
+disk comes from `DescribeVolumes`, which requires `prekv` 0.6+ since earlier
+versions always reported an empty volume set.
 
 ## Changelog
 
 ### 0.6.0
 
-- Added direct KubeVirt provider support via `--kubevirt-kubeconfig`, using the
-  kubeconfig context name as the provider name
+- Added `aws` driver provider support (e.g. for prekv), including disk usage
+  via `DescribeVolumes`
 
 ### 0.5.0
 

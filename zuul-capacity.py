@@ -6,7 +6,7 @@
 
 import argparse
 import openstack
-import kubernetes
+import boto3
 import logging
 import time
 import yaml
@@ -14,15 +14,6 @@ from dataclasses import dataclass
 from prometheus_client import start_http_server, Gauge, Counter
 
 log = logging.getLogger("zuul-capacity")
-
-
-def parse_k8s_quantity(value):
-    "Parse a Kubernetes binary quantity (e.g. '8Gi') into bytes."
-    units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
-    for suffix, factor in units.items():
-        if value.endswith(suffix):
-            return int(float(value[: -len(suffix)]) * factor)
-    return int(value)
 
 
 @dataclass
@@ -45,21 +36,15 @@ class Resource:
         flavor = flavors[flavor_id]
         return Resource(flavor["ram"], flavor["vcpus"], flavor["disk"])
 
-    def from_kubevirt_vm(vm):
-        domain = vm["spec"]["template"]["spec"]["domain"]
-        mem = parse_k8s_quantity(domain["memory"]["guest"]) // (1024**2)
-        cpu = domain["cpu"]["cores"]
-        disk = 0
-        for dvt in vm["spec"].get("dataVolumeTemplates", []):
-            storage = (
-                dvt.get("spec", {})
-                .get("storage", {})
-                .get("resources", {})
-                .get("requests", {})
-                .get("storage")
-            )
-            if storage:
-                disk += parse_k8s_quantity(storage) // (1024**3)
+    def from_aws_instance(instance_types, volume_sizes, instance):
+        instance_type = instance_types[instance["InstanceType"]]
+        mem = instance_type["MemoryInfo"]["SizeInMiB"]
+        cpu = instance_type["VCpuInfo"]["DefaultVCpus"]
+        disk = sum(
+            volume_sizes.get(bdm["Ebs"]["VolumeId"], 0)
+            for bdm in instance.get("BlockDeviceMappings", [])
+            if "Ebs" in bdm
+        )
         return Resource(mem, cpu, disk)
 
 
@@ -77,71 +62,58 @@ def get_resources(flavors, cloud):
     return resources
 
 
-def get_kubevirt_resources(client, namespace):
-    "Get the nodepool-managed KubeVirt VM resources for a namespace."
+def get_aws_resources(instance_types, ec2):
+    "Get the resources of a Nodepool aws driver provider (e.g. backed by prekv)."
+    instances = []
+    for page in ec2.get_paginator("describe_instances").paginate():
+        for reservation in page["Reservations"]:
+            instances.extend(reservation["Instances"])
+
+    unknown_types = {i["InstanceType"] for i in instances} - instance_types.keys()
+    if unknown_types:
+        log.info("Requesting instance types %s", unknown_types)
+        described = ec2.describe_instance_types(InstanceTypes=list(unknown_types))
+        for it in described["InstanceTypes"]:
+            instance_types[it["InstanceType"]] = it
+
+    volume_ids = [
+        bdm["Ebs"]["VolumeId"]
+        for instance in instances
+        for bdm in instance.get("BlockDeviceMappings", [])
+        if "Ebs" in bdm
+    ]
+    volume_sizes = {}
+    if volume_ids:
+        paginator = ec2.get_paginator("describe_volumes")
+        for page in paginator.paginate(VolumeIds=volume_ids):
+            for volume in page["Volumes"]:
+                volume_sizes[volume["VolumeId"]] = volume["Size"]
+
     resources = []
-    vms = client.list_namespaced_custom_object(
-        group="kubevirt.io",
-        version="v1",
-        namespace=namespace,
-        plural="virtualmachines",
-    )
-    for vm in vms.get("items", []):
-        annotations = vm.get("metadata", {}).get("annotations", {})
-        if not annotations.get("prekv.io/nodepool_provider_name"):
-            continue
+    for instance in instances:
         try:
-            resources.append(Resource.from_kubevirt_vm(vm))
+            resources.append(
+                Resource.from_aws_instance(instance_types, volume_sizes, instance)
+            )
         except Exception as e:
-            log.exception("Couldn't get VM resource %s: %s", vm, e)
+            log.exception("Couldn't get instance resource %s: %s", instance, e)
     return resources
-
-
-def get_kubeconfig_namespace(kubeconfig, context):
-    "Look up the namespace of a kubeconfig context."
-    contexts, active_context = kubernetes.config.list_kube_config_contexts(
-        config_file=kubeconfig
-    )
-    selected_context = context or (active_context or {}).get("name")
-    for item in contexts:
-        if item.get("name") == selected_context:
-            namespace = item.get("context", {}).get("namespace")
-            if namespace:
-                return namespace
-    raise ValueError(
-        f"Context {selected_context} is missing a namespace in {kubeconfig}"
-    )
 
 
 @dataclass
 class Provider:
     max_server: int
     driver: str
-    cloud: any = None
-    namespace: str = None
+    cloud: any
 
     def from_nodepool(provider):
-        return Provider(
-            provider.get("max-server", -1),
-            "openstack",
-            cloud=openstack.connect(cloud=provider["cloud"]),
-        )
-
-    def from_kubevirt(kubeconfig, context):
-        if context is None:
-            _, active_context = kubernetes.config.list_kube_config_contexts(
-                config_file=kubeconfig
-            )
-            context = (active_context or {}).get("name")
-        api_client = kubernetes.config.new_client_from_config(
-            config_file=kubeconfig, context=context
-        )
-        return context, Provider(
-            -1,
-            "kubevirt",
-            cloud=kubernetes.client.CustomObjectsApi(api_client),
-            namespace=get_kubeconfig_namespace(kubeconfig, context),
-        )
+        driver = provider.get("driver")
+        if driver == "aws":
+            session = boto3.Session(profile_name=provider["profile-name"])
+            cloud = session.client("ec2")
+        else:
+            cloud = openstack.connect(cloud=provider["cloud"])
+        return Provider(provider.get("max-server", -1), driver, cloud)
 
 
 def get_providers(nodepool_yaml):
@@ -149,16 +121,19 @@ def get_providers(nodepool_yaml):
     providers = dict()
     nodepool = yaml.safe_load(open(nodepool_yaml))
     for provider in nodepool.get("providers", []):
-        if provider.get("driver") == "openstack" and provider.get("cloud"):
+        driver = provider.get("driver")
+        if (driver == "openstack" and provider.get("cloud")) or (
+            driver == "aws" and provider.get("profile-name")
+        ):
             providers[provider.get("name", "unknown")] = Provider.from_nodepool(
                 provider
             )
     return providers
 
 
-def update_provider_metric(metrics, flavors, name, provider):
-    if provider.driver == "kubevirt":
-        resources = get_kubevirt_resources(provider.cloud, provider.namespace)
+def update_provider_metric(metrics, flavors, instance_types, name, provider):
+    if provider.driver == "aws":
+        resources = get_aws_resources(instance_types, provider.cloud)
     else:
         resources = get_resources(flavors, provider.cloud)
     metrics["instances"].labels(cloud=name).set(len(resources))
@@ -172,10 +147,10 @@ def update_provider_metric(metrics, flavors, name, provider):
     metrics["disk"].labels(cloud=name).set(disk)
 
 
-def update_providers_metric(metrics, flavors, providers):
+def update_providers_metric(metrics, flavors, instance_types, providers):
     for name, provider in providers.items():
         try:
-            update_provider_metric(metrics, flavors, name, provider)
+            update_provider_metric(metrics, flavors, instance_types, name, provider)
         except Exception as e:
             log.exception("Couldn't get provider %s: %s", name, e)
             metrics["error"].labels(cloud=name).inc()
@@ -195,18 +170,6 @@ def usage():
         default=8080,
         help="The prometheus scrap target listening port",
     )
-    parser.add_argument(
-        "--kubevirt-kubeconfig",
-        metavar="FILE",
-        default=None,
-        help="Kubeconfig for a KubeVirt-backed provider",
-    )
-    parser.add_argument(
-        "--kubevirt-context",
-        default=None,
-        help="Kubeconfig context to use for the KubeVirt provider,"
-        " also used as the provider name",
-    )
     return parser.parse_args()
 
 
@@ -223,14 +186,10 @@ def main():
     )
 
     providers = get_providers(args.nodepool)
-    if args.kubevirt_kubeconfig:
-        name, provider = Provider.from_kubevirt(
-            args.kubevirt_kubeconfig, args.kubevirt_context
-        )
-        providers[name] = provider
     flavors = dict()
+    instance_types = dict()
 
-    update_providers_metric(metrics, flavors, providers)
+    update_providers_metric(metrics, flavors, instance_types, providers)
 
     # Initialize connection
     log.info("Starting exporter at :%d for %d provider", args.port, len(providers))
@@ -238,7 +197,7 @@ def main():
 
     while True:
         time.sleep(300)
-        update_providers_metric(metrics, flavors, providers)
+        update_providers_metric(metrics, flavors, instance_types, providers)
 
 
 if __name__ == "__main__":
